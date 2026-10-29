@@ -1,0 +1,503 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.8'
+      - name: Generate project
+        run: |
+          flutter create --org ru.example --project-name ess_monitor .
+          mkdir -p lib/models lib/services lib/screens
+          cat > pubspec.yaml <<'EOF'
+          name: ess_monitor
+          description: "Мониторинг инвертора"
+          publish_to: 'none'
+          version: 0.1.0
+          environment:
+            sdk: '>=3.3.0 <4.0.0'
+          dependencies:
+            flutter:
+              sdk: flutter
+            flutter_localizations:
+              sdk: flutter
+            http: ^1.2.1
+            crypto: ^3.0.3
+            shared_preferences: ^2.2.3
+            fl_chart: ^0.68.0
+            mqtt_client: ^10.0.0
+            flutter_local_notifications: ^18.0.1
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^3.0.0
+          flutter:
+            uses-material-design: true
+          EOF
+          cat > lib/main.dart <<'EOF'
+          import 'package:flutter/material.dart';
+          import 'package:flutter_localizations/flutter_localizations.dart';
+          import 'screens/login_screen.dart';
+          import 'screens/dashboard_screen.dart';
+          import 'screens/charts_screen.dart';
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const EssApp());
+          }
+
+          class EssApp extends StatelessWidget {
+            const EssApp({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'Мой инвертор',
+                debugShowCheckedModeBanner: false,
+                locale: const Locale('ru'),
+                supportedLocales: const [Locale('ru')],
+                localizationsDelegates: const [
+                  GlobalMaterialLocalizations.delegate,
+                  GlobalWidgetsLocalizations.delegate,
+                  GlobalCupertinoLocalizations.delegate,
+                ],
+                theme: ThemeData(
+                  colorScheme: ColorScheme.fromSeed(
+                      seedColor: Colors.amber, brightness: Brightness.dark),
+                  useMaterial3: true,
+                ),
+                initialRoute: '/',
+                routes: {
+                  '/': (_) => const LoginScreen(),
+                  '/dashboard': (_) => const DashboardScreen(),
+                  '/charts': (_) => const ChartsScreen(),
+                },
+              );
+            }
+          }
+          EOF
+          cat > lib/models/telemetry.dart <<'EOF'
+          class Telemetry {
+            final DateTime time;
+            final double pvPower;
+            final double battVolt;
+            final double battSoc;
+            final double loadPower;
+            final double gridVolt;
+            final String powerSource;
+
+            Telemetry({
+              required this.time,
+              required this.pvPower,
+              required this.battVolt,
+              required this.battSoc,
+              required this.loadPower,
+              required this.gridVolt,
+              required this.powerSource,
+            });
+
+            factory Telemetry.fromMap(Map<String, dynamic> m) => Telemetry(
+                  time: DateTime.tryParse(m['time'] ?? '') ?? DateTime.now(),
+                  pvPower: _d(m['pv_power']),
+                  battVolt: _d(m['batt_volt']),
+                  battSoc: _d(m['batt_soc']),
+                  loadPower: _d(m['load_power']),
+                  gridVolt: _d(m['grid_volt']),
+                  powerSource: (m['power_source'] ?? 'UNKNOWN').toString(),
+                );
+
+            static double _d(dynamic v) => double.tryParse('$v') ?? 0;
+          }
+          EOF
+          cat > lib/services/shine_api.dart <<'EOF'
+          import 'dart:convert';
+          import 'package:crypto/crypto.dart';
+          import 'package:http/http.dart' as http;
+
+          class ShineApi {
+            static const _host = 'www.dessmonitor.com';
+            final String email;
+            final String password;
+            final String devCode;
+            final String devAddr;
+            final String pn;
+            String? _token;
+
+            ShineApi({
+              required this.email,
+              required this.password,
+              required this.devCode,
+              this.devAddr = '1',
+              this.pn = 'zt',
+            });
+
+            String _sign(Map<String, String> params, String salt) {
+              final keys = params.keys.toList()..sort();
+              final raw = keys.map((k) => '$k=${params[k]}').join('&') +
+                  '&salt=$salt&token=${_token ?? ''}';
+              return md5.convert(utf8.encode(raw)).toString();
+            }
+
+            Uri _buildUri(String action, Map<String, String> params) {
+              final salt = (DateTime.now().millisecondsSinceEpoch ~/ 1000).toString();
+              params['action'] = action;
+              final sign = _sign(params, salt);
+              final q = params.entries.map((e) => '${e.key}=${e.value}').join('&');
+              return Uri.parse('https://$_host/public/?$q&sign=$sign&salt=$salt');
+            }
+
+            Future<void> login() async {
+              final uri = _buildUri('authUser', {
+                'usr': email,
+                'pwd': password,
+                'from': 'android',
+              });
+              final r = await http.get(uri);
+              final j = jsonDecode(r.body);
+              if ('${j['err'] ?? ''}' != '0') {
+                throw Exception('Ошибка входа: ${j['desc'] ?? j}');
+              }
+              _token = j['dat']['token'];
+            }
+
+            Future<Map<String, dynamic>> lastData() async {
+              if (_token == null) await login();
+              final uri = _buildUri('queryDeviceLastData', {
+                'pn': pn,
+                'devcode': devCode,
+                'devaddr': devAddr,
+              });
+              final r = await http.get(uri);
+              final j = jsonDecode(r.body);
+              if ('${j['err'] ?? ''}' != '0') {
+                _token = null;
+                throw Exception('Ошибка данных: ${j['desc'] ?? j}');
+              }
+              return Map<String, dynamic>.from(j['dat'] as Map);
+            }
+          }
+          EOF
+          cat > lib/services/mqtt_local.dart <<'EOF'
+          import 'dart:convert';
+          import 'dart:async';
+          import 'package:mqtt_client/mqtt_client.dart';
+          import 'package:mqtt_client/mqtt_server_client.dart';
+
+          class LocalMqtt {
+            final String host;
+            final int port;
+            final String topic;
+            MqttServerClient? _client;
+            final _controller = StreamController<Map<String, dynamic>>.broadcast();
+            Stream<Map<String, dynamic>> get stream => _controller.stream;
+
+            LocalMqtt({this.host = '192.168.1.50', this.port = 1883,
+                this.topic = 'ess/telemetry'});
+
+            Future<void> connect() async {
+              _client = MqttServerClient(host, 'ess_${DateTime.now().millisecondsSinceEpoch}')
+                ..port = port
+                ..keepAlivePeriod = 20
+                ..autoReconnect = true;
+              await _client!.connect();
+              _client!.subscribe(topic, MqttQos.atMostOnce);
+              _client!.updates!.listen((events) {
+                for (final e in events) {
+                  final payload = MqttPublishPayload.bytesToStringAsString(
+                      (e.payload as MqttPublishMessage).payload.message);
+                  try {
+                    _controller.add(Map<String, dynamic>.from(jsonDecode(payload)));
+                  } catch (_) {}
+                }
+              });
+            }
+
+            void disconnect() => _client?.disconnect();
+          }
+          EOF
+          cat > lib/services/notify_service.dart <<'EOF'
+          import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+
+          class NotifyService {
+            final _fln = FlutterLocalNotificationsPlugin();
+            String? _lastSource;
+
+            Future<void> init() async {
+              const android = AndroidInitializationSettings('@mipmap/ic_launcher');
+              await _fln.initialize(const InitializationSettings(android: android));
+              await _fln
+                  .resolvePlatformSpecificImplementation<
+                      AndroidFlutterLocalNotificationsPlugin>()
+                  ?.requestNotificationsPermission();
+            }
+
+            Future<void> onSourceChanged(String source) async {
+              if (_lastSource == null) { _lastSource = source; return; }
+              if (_lastSource == source) return;
+              _lastSource = source;
+              const details = NotificationDetails(
+                android: AndroidNotificationDetails(
+                  'power_source', 'Источник питания',
+                  channelDescription: 'Смена источника питания инвертора',
+                  importance: Importance.high, priority: Priority.high,
+                ),
+              );
+              await _fln.show(1, 'Смена источника питания',
+                  'Теперь питание от: $source', details);
+            }
+          }
+          EOF
+          cat > lib/screens/login_screen.dart <<'EOF'
+          import 'package:flutter/material.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+          import '../services/shine_api.dart';
+
+          class LoginScreen extends StatefulWidget {
+            const LoginScreen({super.key});
+            @override
+            State<LoginScreen> createState() => _LoginScreenState();
+          }
+
+          class _LoginScreenState extends State<LoginScreen> {
+            final email = TextEditingController();
+            final pass = TextEditingController();
+            final devCode = TextEditingController();
+            final localIp = TextEditingController(text: '192.168.1.50');
+            bool loading = false;
+            String? error;
+
+            Future<void> _login() async {
+              setState(() { loading = true; error = null; });
+              try {
+                final api = ShineApi(
+                  email: email.text.trim(),
+                  password: pass.text,
+                  devCode: devCode.text.trim(),
+                );
+                await api.login();
+                final p = await SharedPreferences.getInstance();
+                await p.setString('email', email.text.trim());
+                await p.setString('pass', pass.text);
+                await p.setString('devcode', devCode.text.trim());
+                await p.setString('mqtt_host', localIp.text.trim());
+                if (mounted) Navigator.pushReplacementNamed(context, '/dashboard');
+              } catch (e) {
+                setState(() => error = '$e');
+              } finally {
+                if (mounted) setState(() => loading = false);
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    const Icon(Icons.solar_power, size: 72, color: Colors.amber),
+                    const SizedBox(height: 16),
+                    Text('Мой инвертор', style: Theme.of(context).textTheme.headlineSmall),
+                    const SizedBox(height: 24),
+                    TextField(controller: email,
+                        decoration: const InputDecoration(labelText: 'E-mail (dessmonitor)')),
+                    TextField(controller: pass, obscureText: true,
+                        decoration: const InputDecoration(labelText: 'Пароль')),
+                    TextField(controller: devCode,
+                        decoration: const InputDecoration(labelText: 'Серийный номер логгера')),
+                    TextField(controller: localIp,
+                        decoration: const InputDecoration(
+                            labelText: 'IP локального шлюза ESP32 (необязательно)')),
+                    if (error != null) Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: Text(error!, style: const TextStyle(color: Colors.red))),
+                    const SizedBox(height: 24),
+                    ElevatedButton(
+                      onPressed: loading ? null : _login,
+                      child: Text(loading ? 'Вход...' : 'Войти'),
+                    ),
+                  ]),
+                ),
+              );
+            }
+          }
+          EOF
+          cat > lib/screens/dashboard_screen.dart <<'EOF'
+          import 'dart:async';
+          import 'package:flutter/material.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+          import '../models/telemetry.dart';
+          import '../services/shine_api.dart';
+          import '../services/mqtt_local.dart';
+          import '../services/notify_service.dart';
+
+          class DashboardScreen extends StatefulWidget {
+            const DashboardScreen({super.key});
+            @override
+            State<DashboardScreen> createState() => _DashboardScreenState();
+          }
+
+          class _DashboardScreenState extends State<DashboardScreen> {
+            Telemetry? t;
+            String status = 'Подключение...';
+            late NotifyService notify;
+            LocalMqtt? mqtt;
+            Timer? cloudTimer;
+            bool useLocal = false;
+
+            @override
+            void initState() {
+              super.initState();
+              notify = NotifyService();
+              _start();
+            }
+
+            Future<void> _start() async {
+              await notify.init();
+              final p = await SharedPreferences.getInstance();
+              try {
+                mqtt = LocalMqtt(host: p.getString('mqtt_host') ?? '192.168.1.50');
+                await mqtt!.connect();
+                useLocal = true;
+                mqtt!.stream.listen((m) {
+                  final nt = Telemetry.fromMap(m);
+                  notify.onSourceChanged(nt.powerSource);
+                  if (mounted) setState(() { t = nt; status = 'Локально (MQTT), ~1 сек'; });
+                });
+              } catch (_) { useLocal = false; }
+              final api = ShineApi(
+                email: p.getString('email') ?? '',
+                password: p.getString('pass') ?? '',
+                devCode: p.getString('devcode') ?? '',
+              );
+              cloudTimer = Timer.periodic(const Duration(seconds: 30), (_) async {
+                if (useLocal) return;
+                try {
+                  final d = await api.lastData();
+                  final nt = Telemetry.fromMap(d);
+                  notify.onSourceChanged(nt.powerSource);
+                  if (mounted) setState(() { t = nt; status = 'Облако, обновление 30 сек'; });
+                } catch (e) {
+                  if (mounted) setState(() => status = 'Ошибка: $e');
+                }
+              });
+            }
+
+            @override
+            void dispose() { cloudTimer?.cancel(); mqtt?.disconnect(); super.dispose(); }
+
+            @override
+            Widget build(BuildContext context) {
+              final theme = Theme.of(context);
+              return Scaffold(
+                appBar: AppBar(title: const Text('Мониторинг инвертора'), actions: [
+                  IconButton(icon: const Icon(Icons.settings),
+                      onPressed: () => Navigator.pushNamed(context, '/charts')),
+                ]),
+                body: RefreshIndicator(
+                  onRefresh: () async => setState(() {}),
+                  child: ListView(padding: const EdgeInsets.all(16), children: [
+                    Text(status, style: theme.textTheme.bodySmall),
+                    const SizedBox(height: 8),
+                    if (t == null)
+                      const Center(child: Padding(
+                        padding: EdgeInsets.all(40), child: CircularProgressIndicator()))
+                    else ...[
+                      _sourceCard(theme),
+                      const SizedBox(height: 12),
+                      _grid(theme),
+                    ],
+                  ]),
+                ),
+              );
+            }
+
+            Widget _sourceCard(ThemeData theme) {
+              final src = t!.powerSource;
+              final color = src == 'SOLAR' ? Colors.green
+                  : src == 'BATTERY' ? Colors.orange : Colors.blue;
+              return Card(
+                color: color.withOpacity(0.12),
+                child: ListTile(
+                  leading: Icon(Icons.bolt, color: color, size: 40),
+                  title: Text('Источник: $src', style: theme.textTheme.titleLarge),
+                  subtitle: Text('Обновлено: ${t!.time}'),
+                ),
+              );
+            }
+
+            Widget _grid(ThemeData theme) {
+              return GridView.count(
+                shrinkWrap: true, physics: const NeverScrollableScrollPhysics(),
+                crossAxisCount: 2, childAspectRatio: 1.6,
+                children: [
+                  _tile(theme, 'PV мощность', '${t!.pvPower.toStringAsFixed(0)} Вт'),
+                  _tile(theme, 'Заряд АКБ', '${t!.battSoc.toStringAsFixed(0)} %'),
+                  _tile(theme, 'Нагрузка', '${t!.loadPower.toStringAsFixed(0)} Вт'),
+                  _tile(theme, 'Сеть', '${t!.gridVolt.toStringAsFixed(0)} В'),
+                  _tile(theme, 'АКБ', '${t!.battVolt.toStringAsFixed(1)} В'),
+                ],
+              );
+            }
+
+            Widget _tile(ThemeData theme, String title, String value) => Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center, children: [
+                  Text(title, style: theme.textTheme.bodySmall),
+                  const SizedBox(height: 6),
+                  Text(value, style: theme.textTheme.titleMedium),
+                ]),
+              ),
+            );
+          }
+          EOF
+          cat > lib/screens/charts_screen.dart <<'EOF'
+          import 'package:fl_chart/fl_chart.dart';
+          import 'package:flutter/material.dart';
+
+          class ChartsScreen extends StatelessWidget {
+            const ChartsScreen({super.key});
+
+            List<FlSpot> get _pv => List.generate(
+                24, (h) => FlSpot(h.toDouble(),
+                    [0, 0, 0, 0, 0, 100, 600, 1500, 2500, 3200, 3500, 3400,
+                     3000, 2400, 1600, 800, 200, 0, 0, 0, 0, 0, 0, 0][h].toDouble()));
+
+            List<FlSpot> get _load => List.generate(
+                24, (h) => FlSpot(h.toDouble(),
+                    800 + 300 * (h % 3) + (h > 7 && h < 22 ? 400 : 0).toDouble()));
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('Графики за 24 часа')),
+                body: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(children: [
+                    Text('PV мощность (Вт)', style: Theme.of(context).textTheme.titleMedium),
+                    Expanded(child: LineChart(LineChartData(lineBarsData: [
+                      LineChartBarData(spots: _pv, isCurved: true, color: Colors.amber, barWidth: 3),
+                    ]))),
+                    const Divider(height: 32),
+                    Text('Нагрузка (Вт)', style: Theme.of(context).textTheme.titleMedium),
+                    Expanded(child: LineChart(LineChartData(lineBarsData: [
+                      LineChartBarData(spots: _load, isCurved: true, color: Colors.blue, barWidth: 3),
+                    ]))),
+                  ]),
+                ),
+              );
+            }
+          }
+          EOF
+      - name: Install dependencies
+        run: flutter pub get
+      - name: Build APK
+        run: flutter build apk --release
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: build/app/outputs/flutter-apk/app-release.apk
