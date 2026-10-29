@@ -492,6 +492,17 @@ jobs:
             }
           }
           EOF
+
+      - name: Enable desugaring
+        run: |
+          python3 - <<'PYEOF'
+          p = 'android/app/build.gradle.kts'
+          s = open(p).read()
+          s = s.replace('compileOptions {', 'compileOptions {\n        isCoreLibraryDesugaringEnabled = true', 1)
+          if 'coreLibraryDesugaring(' not in s:
+              s += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")\n}\n'
+          open(p, 'w').write(s)
+          PYEOF
       - name: Install dependencies
         run: flutter pub get
       - name: Build APK
